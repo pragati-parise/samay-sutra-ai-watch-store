@@ -1,2 +1,11 @@
-Flask==3.1.1
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
 gunicorn==23.0.0
+sqlalchemy==2.0.40
+psycopg[binary]==3.2.6
+PyJWT==2.10.1
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+pydantic[email]==2.11.3
+google-genai==1.12.1
+python-dotenv==1.1.0

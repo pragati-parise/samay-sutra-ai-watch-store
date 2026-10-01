@@ -1,12 +1,27 @@
 services:
   - type: web
-    name: chronolux-watch-store
+    name: samay-sutra-api
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker app:app --bind 0.0.0.0:$PORT
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: SECRET_KEY
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET_KEY
         generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: FRONTEND_ORIGINS
+        sync: false
+  - type: web
+    name: samay-sutra-frontend
+    runtime: static
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: frontend/dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false

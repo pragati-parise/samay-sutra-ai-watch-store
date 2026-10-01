@@ -1,8 +1,11 @@
-import React, { useEffect, useMemo, useState } from "https://esm.sh/react@18.3.1";
-import { createRoot } from "https://esm.sh/react-dom@18.3.1/client";
-import htm from "https://esm.sh/htm@3.1.1";
+import React, { useEffect, useMemo, useState } from "react";
+import { createRoot } from "react-dom/client";
+import htm from "htm";
+import "./style.css";
 
 const html = htm.bind(React.createElement);
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
+const imageUrl = (path) => path?.startsWith("http") ? path : `${API_BASE_URL}${path}`;
 
 const initialFilters = {
   search: "",
@@ -11,15 +14,34 @@ const initialFilters = {
   sort: "",
 };
 
+function formatApiError(data) {
+  if (Array.isArray(data.detail)) {
+    return data.detail
+      .map((item) => {
+        const field = item.loc?.at(-1);
+        const label = field ? `${String(field).replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase())}: ` : "";
+        return `${label}${item.msg || "Invalid value."}`;
+      })
+      .join(" ");
+  }
+  return data.detail || data.error || "Something went wrong.";
+}
+
 async function requestJSON(url, options = {}) {
-  const response = await fetch(url, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
+  const token = localStorage.getItem("watch_store_token");
+  let response;
+  try {
+    response = await fetch(`${API_BASE_URL}${url}`, {
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.headers || {}) },
+      ...options,
+    });
+  } catch {
+    throw new Error(`Cannot connect to the backend at ${API_BASE_URL}. Start it with: uvicorn app:app --reload --port 8000`);
+  }
 
   const data = await response.json();
   if (!response.ok) {
-    throw new Error(data.error || "Something went wrong.");
+    throw new Error(formatApiError(data));
   }
   return data;
 }
@@ -38,6 +60,14 @@ function formatDate(value) {
     month: "short",
     year: "numeric",
   });
+}
+
+function cleanAiText(text) {
+  return text
+    .replace(/\*\*/g, "")
+    .replace(/^\s*[_-]\s*/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function App() {
@@ -64,6 +94,12 @@ function App() {
   const [authOpen, setAuthOpen] = useState(false);
   const [successOpen, setSuccessOpen] = useState(false);
   const [ordersOpen, setOrdersOpen] = useState(false);
+  const [assistantQuestion, setAssistantQuestion] = useState("");
+  const [assistantAnswer, setAssistantAnswer] = useState("");
+  const [recommendation, setRecommendation] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [adminProductId, setAdminProductId] = useState("");
+  const [draftDescription, setDraftDescription] = useState("");
 
   const overlayOpen = drawerOpen || authOpen || successOpen;
 
@@ -105,9 +141,10 @@ function App() {
   }
 
   useEffect(() => {
-    Promise.all([loadProducts(initialFilters), loadCart(), loadSession()]).catch((error) => {
-      setOrderMessage(error.message);
-    });
+    loadProducts(initialFilters).catch((error) => setOrderMessage(error.message));
+    if (localStorage.getItem("watch_store_token")) {
+      Promise.all([loadCart(), loadSession()]).catch(() => localStorage.removeItem("watch_store_token"));
+    }
   }, []);
 
   useEffect(() => {
@@ -120,6 +157,12 @@ function App() {
       setOrdersOpen(false);
     }
   }, [session.authenticated]);
+
+  useEffect(() => {
+    if (ordersOpen) {
+      document.getElementById("my-orders")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }, [ordersOpen]);
 
   const welcomeMessage = useMemo(() => {
     if (session.authenticated && session.user?.name) {
@@ -143,11 +186,17 @@ function App() {
     event.preventDefault();
     const endpoint = authMode === "login" ? "/api/login" : "/api/register";
 
+    if (authMode === "register" && authForm.password.length < 8) {
+      setAuthMessage("Password must be at least 8 characters long.");
+      return;
+    }
+
     try {
       const result = await requestJSON(endpoint, {
         method: "POST",
         body: JSON.stringify(authForm),
       });
+      localStorage.setItem("watch_store_token", result.access_token);
       setAuthMessage(result.message);
       await loadSession();
       setTimeout(() => {
@@ -168,6 +217,9 @@ function App() {
 
   async function logout() {
     await requestJSON("/api/logout", { method: "POST", body: JSON.stringify({}) });
+    localStorage.removeItem("watch_store_token");
+    setSession({ authenticated: false, user: null });
+    setCart({ items: [], subtotal: 0, itemCount: 0 });
     setSuccessOpen(false);
     setAuthOpen(false);
     setOrderMessage("");
@@ -175,12 +227,44 @@ function App() {
   }
 
   async function addToCart(productId) {
+    if (!session.authenticated) { setAuthMode("login"); setAuthOpen(true); return; }
     const data = await requestJSON("/api/cart", {
       method: "POST",
       body: JSON.stringify({ productId, quantity: 1 }),
     });
     setCart(data);
     setDrawerOpen(true);
+  }
+
+  async function askAssistant(event) {
+    event.preventDefault();
+    if (!assistantQuestion.trim()) return;
+    setAiLoading(true); setAssistantAnswer("");
+    try { const result = await requestJSON("/api/ai/assistant", { method: "POST", body: JSON.stringify({ question: assistantQuestion }) }); setAssistantAnswer(result.answer); }
+    catch (error) { setAssistantAnswer(error.message); }
+    finally { setAiLoading(false); }
+  }
+
+  async function getRecommendation() {
+    setAiLoading(true); setRecommendation("");
+    try { const result = await requestJSON("/api/ai/recommendations", { method: "POST", body: JSON.stringify({ budget: 5000, style: "minimal", occasion: "office" }) }); setRecommendation(result.answer); }
+    catch (error) { setRecommendation(error.message); }
+    finally { setAiLoading(false); }
+  }
+
+  async function generateDescription() {
+    const product = products.find((item) => item.id === Number(adminProductId));
+    if (!product) return;
+    setAiLoading(true);
+    try { const result = await requestJSON("/api/ai/product-description", { method: "POST", body: JSON.stringify({ name: product.name, brand: product.brand, category: product.category, strap: product.strap, color: product.color }) }); setDraftDescription(result.description); }
+    catch (error) { setOrderMessage(error.message); }
+    finally { setAiLoading(false); }
+  }
+
+  async function saveDescription() {
+    if (!adminProductId || !draftDescription.trim()) return;
+    try { const result = await requestJSON(`/api/admin/products/${adminProductId}/description`, { method: "PATCH", body: JSON.stringify({ description: draftDescription }) }); setOrderMessage(result.message); await loadProducts(); }
+    catch (error) { setOrderMessage(error.message); }
   }
 
   async function updateCart(productId, quantity) {
@@ -255,8 +339,10 @@ function App() {
               className=${`ghost-button ${session.authenticated ? "" : "hidden"}`}
               type="button"
               onClick=${() => {
-                setOrdersOpen((open) => !open);
-                if (!ordersOpen) {
+                if (ordersOpen) {
+                  setOrdersOpen(false);
+                } else {
+                  setOrdersOpen(true);
                   loadOrders({ openPanel: true }).catch((error) => setOrderMessage(error.message));
                 }
               }}
@@ -341,12 +427,43 @@ function App() {
           <p className=${`order-message ${orderMessage ? "" : "hidden"}`}>${orderMessage}</p>
         </section>
 
+        <section className="ai-studio" aria-label="AI watch concierge">
+          <div className="ai-copy">
+            <p className="orders-kicker">AI-POWERED ASSISTANT</p>
+            <h3>Find a watch that fits your moment.</h3>
+            <p>Our assistant only recommends pieces currently in the Samay Sutra collection.</p>
+            <button className="primary-button" type="button" onClick=${getRecommendation} disabled=${aiLoading}>Recommend an office watch under ₹5,000</button>
+            ${recommendation ? html`
+              <div className="ai-result-card" aria-live="polite">
+                <span className="ai-result-label">Collection match</span>
+                <p className="ai-answer">${cleanAiText(recommendation)}</p>
+              </div>` : null}
+          </div>
+          <form className="ai-form" onSubmit=${askAssistant}>
+            <label htmlFor="ai-question">Type your message...</label>
+            <textarea id="ai-question" value=${assistantQuestion} onInput=${(e) => setAssistantQuestion(e.target.value)} placeholder="Which watch is best for a gift?" maxLength="500"></textarea>
+            <button className="ghost-dark-button" type="submit" disabled=${aiLoading}>${aiLoading ? "Thinking…" : "Ask AI Assistant"}</button>
+            <div className=${`assistant-response ${assistantAnswer ? "has-answer" : ""}`} aria-live="polite">
+              <span className="ai-result-label">AI response</span>
+              <p className="ai-answer">${assistantAnswer ? cleanAiText(assistantAnswer) : "Ask about office watches, gifts, straps, styles, or your budget."}</p>
+            </div>
+          </form>
+          ${session.user?.isAdmin ? html`
+            <div className="ai-form admin-draft">
+              <label htmlFor="admin-product">Admin description studio</label>
+              <select id="admin-product" value=${adminProductId} onChange=${(e) => setAdminProductId(e.target.value)}><option value="">Choose a watch</option>${products.map((p) => html`<option value=${p.id}>${p.name}</option>`)}</select>
+              <button className="ghost-dark-button" type="button" onClick=${generateDescription} disabled=${!adminProductId || aiLoading}>Generate editable draft</button>
+              <textarea value=${draftDescription} onInput=${(e) => setDraftDescription(e.target.value)} placeholder="Generated description appears here; edit it before saving."></textarea>
+              <button className="ghost-dark-button" type="button" onClick=${saveDescription} disabled=${!draftDescription.trim()}>Save edited description</button>
+            </div>` : null}
+        </section>
+
         <section className="product-grid">
           ${products.length
             ? products.map(
                 (product, index) => html`
                   <article className="product-card" style=${{ animationDelay: `${index * 60}ms` }}>
-                    <img src=${product.image} alt=${product.name} />
+                    <img src=${imageUrl(product.image)} alt=${product.name} />
                     <div className="product-info">
                       <span className="pill">${product.category}</span>
                       <div>
@@ -356,9 +473,7 @@ function App() {
                       <p>${product.description}</p>
                       <div className="price-row">
                         <span className="price">${currency(product.price)}</span>
-                        <button className="primary-button" type="button" onClick=${() => addToCart(product.id)}>
-                          Add to cart
-                        </button>
+                        <button className="primary-button" type="button" onClick=${() => addToCart(product.id)}>Add to cart</button>
                       </div>
                     </div>
                   </article>
@@ -374,7 +489,7 @@ function App() {
 
         ${ordersOpen
           ? html`
-              <section className="orders-panel">
+              <section className="orders-panel" id="my-orders">
                 <div className="orders-header">
                   <div>
                     <p className="orders-kicker">Account</p>
@@ -410,7 +525,7 @@ function App() {
                               ${order.items.map(
                                 (item) => html`
                                   <div className="order-item">
-                                    <img src=${item.image} alt=${item.name} />
+                                    <img src=${imageUrl(item.image)} alt=${item.name} />
                                     <div>
                                       <strong>${item.name}</strong>
                                       <p>${item.brand}</p>
@@ -449,7 +564,7 @@ function App() {
           ? cart.items.map(
               (item) => html`
                 <article className="cart-item">
-                  <img src=${item.image} alt=${item.name} />
+                  <img src=${imageUrl(item.image)} alt=${item.name} />
                   <div className="cart-item-body">
                     <div className="cart-line-top">
                       <div>
@@ -580,7 +695,9 @@ function App() {
               type="password"
               value=${authForm.password}
               onInput=${updateAuthField}
-              placeholder="********"
+              placeholder="At least 8 characters"
+              minLength=${authMode === "register" ? 8 : 1}
+              title=${authMode === "register" ? "Password must contain at least 8 characters." : "Enter your password."}
               required
             />
           </div>
